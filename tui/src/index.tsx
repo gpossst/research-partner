@@ -1,0 +1,377 @@
+import { createCliRenderer, TextAttributes } from "@opentui/core";
+import { createRoot, useAppContext, useKeyboard, useTerminalDimensions } from "@opentui/react";
+import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { connectAlder, disconnectAlder } from "./alder-mcp.ts";
+import { getConfig } from "./config.ts";
+import { getCustomToolDefinitions } from "./custom-tools.ts";
+import { mergeChatTools, mcpToolsToOpenAI, runResearchTurn } from "./research-agent.ts";
+import { getWorkspaceRoot } from "./workspace-sandbox.ts";
+
+type ChatLine =
+  | { kind: "user"; text: string }
+  | { kind: "assistant"; text: string; streaming?: boolean }
+  | { kind: "status"; text: string }
+  | { kind: "tools"; names: string[] };
+
+const TOOL_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Footer label while busy (dots animate separately). */
+type BusyCaption =
+  | "thinking"
+  | "writing"
+  | "searching"
+  | "reading"
+  | "researching"
+  | "running";
+
+function captionVerb(c: BusyCaption): string {
+  switch (c) {
+    case "thinking":
+      return "Thinking";
+    case "writing":
+      return "Writing";
+    case "searching":
+      return "Searching";
+    case "reading":
+      return "Reading";
+    case "researching":
+      return "Researching";
+    case "running":
+      return "Running";
+  }
+}
+
+/** Derive activity from tools invoked in the current batch (priority if multiple). */
+function busyCaptionFromToolNames(names: string[]): BusyCaption {
+  const s = new Set(names);
+  if (s.has("deep_search")) return "researching";
+  if (s.has("web_search")) return "searching";
+  if (s.has("fetch_url") || s.has("read_file_lines")) return "reading";
+  if (s.has("edit_file")) return "writing";
+  if (s.has("bash")) return "running";
+  return "thinking";
+}
+
+function ToolsRunningRow({ names }: { names: string[] }) {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setFrame((f) => (f + 1) % TOOL_SPINNER.length), 90);
+    return () => clearInterval(id);
+  }, []);
+  const label = names.length ? names.join(", ") : "tools";
+  return (
+    <text>
+      <span fg="#e0af68">{TOOL_SPINNER[frame]!}</span>
+      <span fg="#7aa2f7"> Calling </span>
+      <span attributes={TextAttributes.DIM}>{label}</span>
+      <span attributes={TextAttributes.DIM}> …</span>
+    </text>
+  );
+}
+
+function App() {
+  const { renderer } = useAppContext();
+  const { height } = useTerminalDimensions();
+  const cfg = getConfig();
+
+  const [lines, setLines] = useState<ChatLine[]>(() => [
+    {
+      kind: "status",
+      text: cfg.isConfigured
+        ? "Connecting to Alder MCP…"
+        : "Set FIREWORKS_API_KEY and ALDER_API_KEY (see .env.example), then restart.",
+    },
+  ]);
+  const [inputKey, setInputKey] = useState(0);
+  const [ready, setReady] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [busyCaption, setBusyCaption] = useState<BusyCaption>("thinking");
+  const [workingDots, setWorkingDots] = useState(0);
+  const [toolsLabel, setToolsLabel] = useState("");
+  const [workspacePath, setWorkspacePath] = useState("");
+
+  const conversationRef = useRef<ChatCompletionMessageParam[]>([]);
+  const fireworksRef = useRef<OpenAI | null>(null);
+  const toolsRef = useRef<ReturnType<typeof mcpToolsToOpenAI>>([]);
+
+  useKeyboard((key) => {
+    if (key.name === "escape") {
+      renderer?.destroy();
+    }
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function init() {
+      const env = getConfig();
+      if (!env.isConfigured) {
+        return;
+      }
+
+      try {
+        setWorkspacePath(getWorkspaceRoot());
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setLines((prev) => [
+          ...prev,
+          { kind: "status", text: `Bad workspace: ${msg}` },
+        ]);
+        return;
+      }
+
+      try {
+        const client = await connectAlder(env.alderMcpUrl, env.alderApiKey);
+        if (cancelled) return;
+
+        const listed = await client.listTools();
+        const tools = mergeChatTools(
+          mcpToolsToOpenAI(listed.tools),
+          getCustomToolDefinitions(),
+        );
+        toolsRef.current = tools;
+        fireworksRef.current = new OpenAI({
+          apiKey: env.fireworksApiKey,
+          baseURL: env.fireworksBaseUrl,
+        });
+
+        setToolsLabel(tools.map((t) => t.function.name).join(", "));
+        setReady(true);
+        setLines((prev) => [
+          ...prev.filter((l) => l.kind !== "status" || !l.text.startsWith("Connecting")),
+          {
+            kind: "status",
+            text: `Ready (Fireworks). Tools: ${tools.map((t) => t.function.name).join(", ")} — Enter asks the model; Esc exits.`,
+          },
+        ]);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setLines((prev) => [
+          ...prev,
+          {
+            kind: "status",
+            text: `Failed to connect to Alder: ${msg}`,
+          },
+        ]);
+      }
+    }
+
+    void init();
+
+    return () => {
+      cancelled = true;
+      void disconnectAlder();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!busy) {
+      setWorkingDots(0);
+      return;
+    }
+    const id = setInterval(() => setWorkingDots((d) => (d + 1) % 4), 420);
+    return () => clearInterval(id);
+  }, [busy]);
+
+  function finalizePendingToolLines(lines: ChatLine[]): ChatLine[] {
+    return lines.map((l) =>
+      l.kind === "tools" ? { kind: "status", text: `· ${l.names.join(", ")}` } : l,
+    );
+  }
+
+  const onSubmit = useCallback(
+    async (value: string) => {
+      const q = value.trim();
+      if (!q || busy || !ready) return;
+
+      const fireworks = fireworksRef.current;
+      const tools = toolsRef.current;
+      if (!fireworks || tools.length === 0) return;
+
+      setBusy(true);
+      setBusyCaption("thinking");
+      setLines((prev) => [...prev, { kind: "user", text: q }]);
+
+      const userMessage: ChatCompletionMessageParam = { role: "user", content: q };
+
+      try {
+        const { messages, assistantText } = await runResearchTurn({
+          client: fireworks,
+          model: cfg.fireworksModel,
+          tools,
+          messages: [...conversationRef.current, userMessage],
+          onToolProgress: ({ names }) => {
+            setBusyCaption(busyCaptionFromToolNames(names));
+            setLines((prev) => [...prev, { kind: "tools", names }]);
+          },
+          assistantStream: {
+            onBegin: () => {
+              setBusyCaption("writing");
+              setLines((prev) => {
+                const next = [...prev];
+                for (let i = next.length - 1; i >= 0; i--) {
+                  const line = next[i];
+                  if (line?.kind === "tools") {
+                    next[i] = { kind: "status", text: `· ${line.names.join(", ")}` };
+                    break;
+                  }
+                }
+                next.push({ kind: "assistant", text: "", streaming: true });
+                return next;
+              });
+            },
+            onDelta: (snapshot) => {
+              setLines((prev) => {
+                const next = [...prev];
+                for (let i = next.length - 1; i >= 0; i--) {
+                  const line = next[i];
+                  if (line?.kind === "assistant" && line.streaming) {
+                    next[i] = { kind: "assistant", text: snapshot, streaming: true };
+                    return next;
+                  }
+                }
+                return prev;
+              });
+            },
+            onEnd: (finalContent) => {
+              setLines((prev) => {
+                const next = [...prev];
+                for (let i = next.length - 1; i >= 0; i--) {
+                  const line = next[i];
+                  if (line?.kind === "assistant" && line.streaming) {
+                    next[i] = { kind: "assistant", text: finalContent, streaming: false };
+                    return next;
+                  }
+                }
+                return prev;
+              });
+            },
+          },
+        });
+
+        conversationRef.current = messages;
+        if (!assistantText.trim()) {
+          setLines((prev) => {
+            const next = [...prev];
+            for (let i = next.length - 1; i >= 0; i--) {
+              const line = next[i];
+              if (line?.kind === "assistant") {
+                next[i] = { kind: "assistant", text: "(no text)", streaming: false };
+                break;
+              }
+            }
+            return next;
+          });
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setLines((prev) => {
+          let next = finalizePendingToolLines(prev);
+          for (let i = next.length - 1; i >= 0; i--) {
+            const line = next[i];
+            if (line?.kind === "assistant" && line.streaming) {
+              next = [...next];
+              next[i] = {
+                kind: "assistant",
+                text: line.text.trim() ? line.text : "(interrupted)",
+                streaming: false,
+              };
+              break;
+            }
+          }
+          return [...next, { kind: "status", text: `Error: ${msg}` }];
+        });
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy, cfg.fireworksModel, ready],
+  );
+
+  const scrollHeight = Math.max(8, height - 8);
+
+  return (
+    <box flexDirection="column" flexGrow={1} padding={1}>
+      <box flexDirection="column" marginBottom={1}>
+        <ascii-font font="tiny" text="Research Partner" />
+        <text attributes={TextAttributes.DIM}>
+          Web via Alder MCP · Fireworks AI · Esc quit
+        </text>
+        {workspacePath ? (
+          <text attributes={TextAttributes.DIM}>Workspace: {workspacePath}</text>
+        ) : null}
+      </box>
+
+      <scrollbox
+        focused={!busy}
+        stickyScroll
+        stickyStart="bottom"
+        style={{
+          flexGrow: 1,
+          height: scrollHeight,
+          rootOptions: { backgroundColor: "#1e2030" },
+          viewportOptions: { backgroundColor: "#1a1b26" },
+        }}
+      >
+        {lines.map((line, i) => (
+          <box key={i} style={{ paddingBottom: 1 }}>
+            {line.kind === "user" ? (
+              <text>
+                <span fg="#7dcfff">You </span>
+                {line.text}
+              </text>
+            ) : line.kind === "assistant" ? (
+              <text>
+                <span fg="#bb9af7">Assistant </span>
+                {line.text}
+                {line.streaming ? (
+                  <span attributes={TextAttributes.DIM}>▍</span>
+                ) : null}
+              </text>
+            ) : line.kind === "tools" ? (
+              <ToolsRunningRow names={line.names} />
+            ) : (
+              <text attributes={TextAttributes.DIM}>{line.text}</text>
+            )}
+          </box>
+        ))}
+      </scrollbox>
+
+      <box flexDirection="column" marginTop={1} gap={1}>
+        <text attributes={TextAttributes.DIM}>
+          {busy
+            ? `${captionVerb(busyCaption)}${".".repeat(workingDots)}`
+            : "Ask — Enter to send"}
+        </text>
+        <box border flexDirection="column" paddingLeft={1} paddingRight={1} paddingBottom={1}>
+          <input
+            key={inputKey}
+            placeholder={
+              ready ? "Type a question…" : cfg.isConfigured ? "Starting…" : "Configure API keys first"
+            }
+            focused={ready && !busy}
+            onSubmit={(v) => {
+              const text = typeof v === "string" ? v : "";
+              if (!text.trim()) return;
+              void onSubmit(text);
+              setInputKey((k) => k + 1);
+            }}
+          />
+        </box>
+        <text attributes={TextAttributes.DIM}>
+          {toolsLabel ? `Tools loaded: ${toolsLabel}` : ""}
+        </text>
+      </box>
+    </box>
+  );
+}
+
+const renderer = await createCliRenderer({
+  exitOnCtrlC: true,
+  onDestroy() {
+    void disconnectAlder().finally(() => process.exit(0));
+  },
+});
+createRoot(renderer).render(<App />);
