@@ -20,6 +20,7 @@ Guidelines:
 - Use deep_search when the question needs breadth (several sources in one shot) or synthesis from multiple pages.
 - Cite or name your sources (page title and URL) when you rely on them.
 - If tools return errors or empty results, say so briefly and adjust your approach.
+- If you don't think you need an entire page's data, make sure to include a find parameter to the tool call to limit the amount tokens you consume.
 - Be concise but useful: default to short answers with clear headings; expand when the user asks for depth.
 - Cite every piece of information with a source; never make up information. Put the link to the source directly in the section where the information is found so the user can learn more.`;
 
@@ -107,6 +108,47 @@ function truncateToolText(s: string): string {
   return `${s.slice(0, MAX_TOOL_CHARS)}\n\n...[truncated ${s.length - MAX_TOOL_CHARS} chars]`;
 }
 
+function compactValue(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (v == null) return "";
+  return JSON.stringify(v);
+}
+
+function quoteValue(v: unknown): string {
+  const s = compactValue(v).replace(/\s+/g, " ").trim();
+  const clipped = s.length > 60 ? `${s.slice(0, 57)}...` : s;
+  return `"${clipped.replaceAll('"', '\\"')}"`;
+}
+
+export function summarizeToolCall(
+  name: string,
+  args: Record<string, unknown>,
+): string {
+  const parts = [name];
+
+  if (typeof args.query === "string" && args.query.trim()) {
+    parts.push(`query=${quoteValue(args.query)}`);
+  }
+  if (typeof args.url === "string" && args.url.trim()) {
+    parts.push(`url=${quoteValue(args.url)}`);
+  }
+  if (typeof args.find === "string" && args.find.trim()) {
+    parts.push(`find=${quoteValue(args.find)}`);
+  }
+  if (typeof args.filename === "string" && args.filename.trim()) {
+    parts.push(`file=${compactValue(args.filename)}`);
+  }
+  if (args.startline != null || args.endline != null) {
+    parts.push(`lines=${compactValue(args.startline)}-${compactValue(args.endline)}`);
+  }
+  if (typeof args.command === "string" && args.command.trim()) {
+    parts.push(`command=${quoteValue(args.command)}`);
+  }
+
+  return parts.join(" ");
+}
+
 function parseToolArguments(raw: string): Record<string, unknown> {
   if (!raw?.trim()) return {};
   try {
@@ -119,7 +161,10 @@ function parseToolArguments(raw: string): Record<string, unknown> {
   }
 }
 
-export type ToolProgress = { phase: "tool"; names: string[] };
+export type ToolProgress = {
+  phase: "tool";
+  calls: { name: string; summary: string }[];
+};
 
 /** Fired once per chat completion request in the tool loop (each needs its own assistant row when streaming). */
 export type AssistantStreamHooks = {
@@ -200,22 +245,30 @@ export async function runResearchTurn(options: {
       };
     }
 
+    const parsedToolCalls = toolCalls
+      .filter((tc) => tc.type === "function")
+      .map((tc) => {
+        const args = parseToolArguments(tc.function.arguments ?? "");
+        return {
+          tc,
+          args,
+          name: tc.function.name,
+          summary: summarizeToolCall(tc.function.name, args),
+        };
+      });
+
     onToolProgress?.({
       phase: "tool",
-      names: toolCalls
-        .filter((tc) => tc.type === "function")
-        .map((tc) => tc.function.name),
+      calls: parsedToolCalls.map(({ name, summary }) => ({ name, summary })),
     });
 
-    for (const tc of toolCalls) {
-      if (tc.type !== "function") continue;
-      const args = parseToolArguments(tc.function.arguments ?? "");
-      const content = await invokeTool(tc.function.name, args);
-      messages.push({
+    const toolMessages: ChatCompletionMessageParam[] = await Promise.all(
+      parsedToolCalls.map(async ({ tc, args }) => ({
         role: "tool",
         tool_call_id: tc.id,
-        content,
-      });
-    }
+        content: await invokeTool(tc.function.name, args),
+      })),
+    );
+    messages.push(...toolMessages);
   }
 }

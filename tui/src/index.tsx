@@ -9,16 +9,16 @@ import { getConfig } from "./config.ts";
 import { getCustomToolDefinitions } from "./custom-tools.ts";
 import { promptCredentialsIfNeeded } from "./prompt-credentials-cli.ts";
 import { loadUserCredentialsIntoEnv } from "./user-credentials.ts";
-import { mergeChatTools, mcpToolsToOpenAI, runResearchTurn } from "./research-agent.ts";
+import { mergeChatTools, mcpToolsToOpenAI, runResearchTurn, type ToolProgress } from "./research-agent.ts";
 import { getWorkspaceRoot } from "./workspace-sandbox.ts";
 
 type ChatLine =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; streaming?: boolean }
   | { kind: "status"; text: string }
-  | { kind: "tools"; names: string[] };
+  | { kind: "tools"; calls: ToolProgress["calls"] };
 
-const TOOL_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TOOL_SPINNER = ["|", "/", "-", "\\"];
 
 /** Footer label while busy (dots animate separately). */
 type BusyCaption =
@@ -47,8 +47,8 @@ function captionVerb(c: BusyCaption): string {
 }
 
 /** Derive activity from tools invoked in the current batch (priority if multiple). */
-function busyCaptionFromToolNames(names: string[]): BusyCaption {
-  const s = new Set(names);
+function busyCaptionFromToolCalls(calls: ToolProgress["calls"]): BusyCaption {
+  const s = new Set(calls.map((call) => call.name));
   if (s.has("deep_search")) return "researching";
   if (s.has("web_search")) return "searching";
   if (s.has("fetch_url") || s.has("read_file_lines")) return "reading";
@@ -57,21 +57,29 @@ function busyCaptionFromToolNames(names: string[]): BusyCaption {
   return "thinking";
 }
 
-function ToolsRunningRow({ names }: { names: string[] }) {
+function ToolsRunningRow({ calls }: { calls: ToolProgress["calls"] }) {
   const [frame, setFrame] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => setFrame((f) => (f + 1) % TOOL_SPINNER.length), 90);
+    const id = setInterval(() => setFrame((f) => (f + 1) % TOOL_SPINNER.length), 120);
     return () => clearInterval(id);
   }, []);
-  const label = names.length ? names.join(", ") : "tools";
+  const summaries = calls.length ? calls.map((call) => call.summary) : ["tools"];
   return (
-    <text>
-      <span fg="#e0af68">{TOOL_SPINNER[frame]!}</span>
-      <span fg="#7aa2f7"> Calling </span>
-      <span attributes={TextAttributes.DIM}>{label}</span>
-      <span attributes={TextAttributes.DIM}> …</span>
-    </text>
+    <box flexDirection="column">
+      {summaries.map((summary, i) => (
+        <text key={i}>
+          <span fg="#e0af68">{TOOL_SPINNER[frame]!}</span>
+          <span fg="#7aa2f7"> Calling </span>
+          <span attributes={TextAttributes.DIM}>{summary}</span>
+        </text>
+      ))}
+    </box>
   );
+}
+
+function toolStatusText(calls: ToolProgress["calls"]): string {
+  const summaries = calls.length ? calls.map((call) => call.summary) : ["tools"];
+  return `· ${summaries.join("; ")}`;
 }
 
 function App() {
@@ -197,7 +205,7 @@ function App() {
 
   function finalizePendingToolLines(lines: ChatLine[]): ChatLine[] {
     return lines.map((l) =>
-      l.kind === "tools" ? { kind: "status", text: `· ${l.names.join(", ")}` } : l,
+      l.kind === "tools" ? { kind: "status", text: toolStatusText(l.calls) } : l,
     );
   }
 
@@ -232,9 +240,19 @@ function App() {
           model: cfg.fireworksModel,
           tools,
           messages: [...conversationRef.current, userMessage],
-          onToolProgress: ({ names }) => {
-            setBusyCaption(busyCaptionFromToolNames(names));
-            setLines((prev) => [...prev, { kind: "tools", names }]);
+          onToolProgress: ({ calls }) => {
+            setBusyCaption(busyCaptionFromToolCalls(calls));
+            setLines((prev) => {
+              const next = prev.filter(
+                (line) =>
+                  !(
+                    line.kind === "assistant" &&
+                    line.streaming === false &&
+                    !line.text.trim()
+                  ),
+              );
+              return [...next, { kind: "tools", calls }];
+            });
           },
           assistantStream: {
             onBegin: () => {
@@ -244,7 +262,7 @@ function App() {
                 for (let i = next.length - 1; i >= 0; i--) {
                   const line = next[i];
                   if (line?.kind === "tools") {
-                    next[i] = { kind: "status", text: `· ${line.names.join(", ")}` };
+                    next[i] = { kind: "status", text: toolStatusText(line.calls) };
                     break;
                   }
                 }
@@ -357,15 +375,19 @@ function App() {
                 ))}
               </box>
             ) : line.kind === "assistant" ? (
-              <text>
-                <span fg="#bb9af7">Assistant </span>
-                {line.text}
-                {line.streaming ? (
-                  <span attributes={TextAttributes.DIM}>▍</span>
+              <box flexDirection="column" gap={0}>
+                <text fg="#bb9af7">Assistant</text>
+                {line.text || line.streaming ? (
+                  <text>
+                    {line.text}
+                    {line.streaming ? (
+                      <span attributes={TextAttributes.DIM}>▍</span>
+                    ) : null}
+                  </text>
                 ) : null}
-              </text>
+              </box>
             ) : line.kind === "tools" ? (
-              <ToolsRunningRow names={line.names} />
+              <ToolsRunningRow calls={line.calls} />
             ) : (
               <text attributes={TextAttributes.DIM}>{line.text}</text>
             )}
