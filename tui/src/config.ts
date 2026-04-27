@@ -1,4 +1,9 @@
-/** Environment-driven config. Never commit API keys. */
+/**
+ * Environment-driven config. Never commit API keys.
+ *
+ * Credential precedence: process env vars override `~/.config/research-partner/credentials.json`
+ * (written on first interactive setup or edited by hand).
+ */
 
 export function getConfig() {
   const fireworksApiKey = process.env.FIREWORKS_API_KEY ?? "";

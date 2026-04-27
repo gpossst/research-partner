@@ -6,8 +6,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { connectAlder, disconnectAlder } from "./alder-mcp.ts";
 import { getConfig } from "./config.ts";
 import { getCustomToolDefinitions } from "./custom-tools.ts";
+import {
+  credentialsFilePath,
+  loadUserCredentialsIntoEnv,
+  saveUserCredentials,
+} from "./user-credentials.ts";
 import { mergeChatTools, mcpToolsToOpenAI, runResearchTurn } from "./research-agent.ts";
 import { getWorkspaceRoot } from "./workspace-sandbox.ts";
+
+loadUserCredentialsIntoEnv();
 
 type ChatLine =
   | { kind: "user"; text: string }
@@ -74,16 +81,30 @@ function ToolsRunningRow({ names }: { names: string[] }) {
 function App() {
   const { renderer } = useAppContext();
   const { height } = useTerminalDimensions();
+  const [configRev, setConfigRev] = useState(0);
   const cfg = getConfig();
+  const pendingFireworksRef = useRef("");
 
-  const [lines, setLines] = useState<ChatLine[]>(() => [
-    {
-      kind: "status",
-      text: cfg.isConfigured
-        ? "Connecting to Alder MCP…"
-        : "Set FIREWORKS_API_KEY and ALDER_API_KEY (see .env.example), then restart.",
-    },
-  ]);
+  const [setupStep, setSetupStep] = useState<"fireworks" | "alder" | null>(() =>
+    getConfig().isConfigured ? null : "fireworks",
+  );
+
+  const [lines, setLines] = useState<ChatLine[]>(() => {
+    const c = getConfig();
+    if (c.isConfigured) {
+      return [{ kind: "status", text: "Connecting to Alder MCP…" }];
+    }
+    return [
+      {
+        kind: "status",
+        text: `API keys required. Paste your Fireworks key below, then Enter. Keys are stored in ${credentialsFilePath()} (chmod 600).`,
+      },
+      {
+        kind: "status",
+        text: "Tip: terminal input may echo characters — paste carefully. Env vars FIREWORKS_API_KEY / ALDER_API_KEY override the saved file.",
+      },
+    ];
+  });
   const [inputKey, setInputKey] = useState(0);
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -140,7 +161,11 @@ function App() {
         setToolsLabel(tools.map((t) => t.function.name).join(", "));
         setReady(true);
         setLines((prev) => [
-          ...prev.filter((l) => l.kind !== "status" || !l.text.startsWith("Connecting")),
+          ...prev.filter(
+            (l) =>
+              l.kind !== "status" ||
+              (!l.text.startsWith("Connecting") && !l.text.startsWith("Keys saved")),
+          ),
           {
             kind: "status",
             text: `Ready (Fireworks). Tools: ${tools.map((t) => t.function.name).join(", ")} — Enter asks the model; Esc exits.`,
@@ -164,7 +189,7 @@ function App() {
       cancelled = true;
       void disconnectAlder();
     };
-  }, []);
+  }, [configRev]);
 
   useEffect(() => {
     if (!busy) {
@@ -184,7 +209,7 @@ function App() {
   const onSubmit = useCallback(
     async (value: string) => {
       const q = value.trim();
-      if (!q || busy || !ready) return;
+      if (!q || busy || !ready || setupStep !== null) return;
 
       const fireworks = fireworksRef.current;
       const tools = toolsRef.current;
@@ -287,7 +312,7 @@ function App() {
         setBusy(false);
       }
     },
-    [busy, cfg.fireworksModel, ready],
+    [busy, cfg.fireworksModel, ready, setupStep],
   );
 
   const scrollHeight = Math.max(8, height - 8);
@@ -305,7 +330,7 @@ function App() {
       </box>
 
       <scrollbox
-        focused={!busy}
+        focused={!busy && (ready || setupStep !== null)}
         stickyScroll
         stickyStart="bottom"
         style={{
@@ -343,18 +368,65 @@ function App() {
         <text attributes={TextAttributes.DIM}>
           {busy
             ? `${captionVerb(busyCaption)}${".".repeat(workingDots)}`
-            : "Ask — Enter to send"}
+            : setupStep === "fireworks"
+              ? "Fireworks — Enter to continue"
+              : setupStep === "alder"
+                ? "Alder — Enter to save and connect"
+                : "Ask — Enter to send"}
         </text>
         <box border flexDirection="column" paddingLeft={1} paddingRight={1} paddingBottom={1}>
           <input
             key={inputKey}
             placeholder={
-              ready ? "Type a question…" : cfg.isConfigured ? "Starting…" : "Configure API keys first"
+              setupStep === "fireworks"
+                ? "Paste Fireworks API key…"
+                : setupStep === "alder"
+                  ? "Paste Alder API key…"
+                  : ready
+                    ? "Type a question…"
+                    : cfg.isConfigured
+                      ? "Starting…"
+                      : "Paste Fireworks API key…"
             }
-            focused={ready && !busy}
+            focused={(ready || setupStep !== null) && !busy}
             onSubmit={(v) => {
               const text = typeof v === "string" ? v : "";
               if (!text.trim()) return;
+
+              if (setupStep === "fireworks") {
+                pendingFireworksRef.current = text.trim();
+                setSetupStep("alder");
+                setLines((prev) => [
+                  ...prev,
+                  {
+                    kind: "status",
+                    text: "Paste your Alder API key below, then Enter.",
+                  },
+                ]);
+                setInputKey((k) => k + 1);
+                return;
+              }
+
+              if (setupStep === "alder") {
+                try {
+                  saveUserCredentials({
+                    fireworksApiKey: pendingFireworksRef.current,
+                    alderApiKey: text.trim(),
+                  });
+                  setSetupStep(null);
+                  setConfigRev((r) => r + 1);
+                  setLines((prev) => [
+                    ...prev,
+                    { kind: "status", text: "Keys saved. Connecting to Alder MCP…" },
+                  ]);
+                } catch (e) {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  setLines((prev) => [...prev, { kind: "status", text: `Could not save keys: ${msg}` }]);
+                }
+                setInputKey((k) => k + 1);
+                return;
+              }
+
               void onSubmit(text);
               setInputKey((k) => k + 1);
             }}
